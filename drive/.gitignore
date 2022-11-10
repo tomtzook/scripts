@@ -1,0 +1,8 @@
+*.xlsx
+*.db
+*.json
+*.pyc
+progress
+temp
+outdata
+*.docx

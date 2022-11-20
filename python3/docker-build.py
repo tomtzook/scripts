@@ -1,10 +1,13 @@
 from typing import Optional
-
-import docker
-from docker.models.containers import Container
-import argparse
-
 from abc import ABC, abstractmethod
+
+import argparse
+import tarfile
+import tempfile
+import os
+import docker
+
+from docker.models.containers import Container
 
 
 def run_in_container(container: Container, cmd: str, working_dir: Optional[str] = None):
@@ -33,17 +36,30 @@ class Source(ABC):
 
 class GitRepoSource(Source):
 
-    def __init__(self, container: Container, repo: str):
+    def __init__(self, container: Container, repo: str, branch: str):
         self._container = container
         self._repo = repo
+        self._branch = branch
         self._cloned_path = '/source'
 
     def prepare_source(self):
-        print('Cloning git repo', self._repo)
-        run_in_container(
-            self._container,
-            f"git clone {self._repo} {self._cloned_path}"
-        )
+        if self._branch:
+            print('Cloning git repo', self._repo, 'at branch', self._branch)
+            run_in_container(
+                self._container,
+                f"git clone --branch {self._branch} {self._repo} {self._cloned_path}"
+            )
+        else:
+            print('Cloning git repo', self._repo)
+            run_in_container(
+                self._container,
+                f"git clone {self._repo} {self._cloned_path}"
+            )
+
+        print('Handling submodules')
+        run_in_container(self._container,
+                         'git submodule update --init --recursive',
+                         working_dir=self._cloned_path)
 
     @property
     def path(self):
@@ -55,13 +71,23 @@ class HostDirSource(Source):
     def __init__(self, container: Container, host_path: str):
         self._container = container
         self._host_path = host_path
+        self._path_in_container = '/'
+        self._folder_name = 'source'
 
     def prepare_source(self):
-        pass
+        temp_tar_file = tempfile.mktemp(suffix='tar.gz')
+        try:
+            with tarfile.open(temp_tar_file, "w:gz") as tar:
+                tar.add(self._host_path, arcname=self._folder_name)
+
+            with open(temp_tar_file, 'rb') as f:
+                self._container.put_archive(self._path_in_container, f.read())
+        finally:
+            os.remove(temp_tar_file)
 
     @property
     def path(self):
-        pass
+        return os.path.join(self._path_in_container, self._folder_name)
 
 
 class BuildSystem(ABC):
@@ -77,16 +103,17 @@ class BuildSystem(ABC):
 
 class GradlewBuildSystem(BuildSystem):
 
-    def __init__(self, container: Container, task_name: str, should_clean: bool):
+    def __init__(self, container: Container, task_name: str, should_clean: bool, extra_args: str):
         self._container = container
         self._task_name = task_name
         self._should_clean = should_clean
+        self._extra_args = extra_args
 
     def build(self, source: Source):
         print('Running build with gradlew')
         run_in_container(
             self._container,
-            f"./gradlew{' clean ' if self._should_clean else ''}{self._task_name}",
+            self._build_gradle_command(),
             working_dir=source.path
         )
         run_in_container(
@@ -109,11 +136,20 @@ class GradlewBuildSystem(BuildSystem):
 
         print('Downloaded to', out_path)
 
+    def _build_gradle_command(self) -> str:
+        cmd = './gradlew '
+        if self._should_clean:
+            cmd += 'clean '
+        cmd += self._task_name
+        if self._extra_args:
+            cmd += ' ' + self._extra_args
+        return cmd
+
 
 def run(container: Container, args: argparse.Namespace):
     if args.repo:
         print('Building from repo', args.repo)
-        source = GitRepoSource(container, args.repo)
+        source = GitRepoSource(container, args.repo, args.repo_branch)
     elif args.path:
         print('Building from directory', args.path)
         source = HostDirSource(container, args.path)
@@ -125,8 +161,10 @@ def run(container: Container, args: argparse.Namespace):
         print('\tUsing task', args.gradle_task)
         if args.gradle_clean:
             print('\tCleaning first')
+        if args.gradle_extra_args:
+            print(f'\tWith args: \"{args.gradle_extra_args}\"')
 
-        build_system = GradlewBuildSystem(container, args.gradle_task, args.gradle_clean)
+        build_system = GradlewBuildSystem(container, args.gradle_task, args.gradle_clean, args.gradle_extra_args)
     else:
         raise RuntimeError('build type not selected')
 
@@ -146,6 +184,11 @@ def main():
                         action='store',
                         type=str,
                         help='Link to the repository to build')
+    parser.add_argument('--repo-branch',
+                        action='store',
+                        type=str,
+                        default=None,
+                        help='Branch of the repository to build. Use with --repo')
     parser.add_argument('--path',
                         action='store',
                         type=str,
@@ -163,12 +206,18 @@ def main():
                         help='Build with gradle wrapper')
     parser.add_argument('--gradle-task',
                         action='store',
+                        type=str,
                         default='build',
                         help='Name of task to use for building')
     parser.add_argument('--gradle-clean',
                         action='store_true',
                         default=True,
                         help='Whether to clean before building with gradle')
+    parser.add_argument('--gradle-extra-args',
+                        action='store',
+                        type=str,
+                        default=None,
+                        help='Additional args to pass to gradle')
 
     args = parser.parse_args()
 

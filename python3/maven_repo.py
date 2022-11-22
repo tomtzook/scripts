@@ -13,6 +13,7 @@ import timehelper
 class KnownMavenRepo(enum.Enum):
     CENTRAL = r'https://repo1.maven.org/maven2'
     SONATYPE_SNAPSHOTS = r'https://oss.sonatype.org/content/repositories/snapshots'
+    FRC_RELEASE = r' https://frcmaven.wpi.edu/artifactory/release'
 
     def __str__(self):
         return self.name.lower()
